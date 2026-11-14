@@ -15,17 +15,22 @@ Design notes, each derived from the kit's env / scorer / generator:
 - Every provider call is a function of the brief and of the provider
   answers seen so far: no wall clock, no unseeded randomness. A replay
   therefore sees the same answers and makes the same choices.
-- Candidates are ranked by sealed rating (ties: provider id, model id).
-  One attempt is made per provider per round: a refusal is a property of
-  the provider's budget / failure schedule / outage, not of the model,
-  so retrying another model on the same provider would only burn budget.
-  A second round retries providers that failed exactly once, which is
-  how a scheduled single-call failure is recovered.
-- A provider is skipped once it has failed three times in a row. At most
-  two failures per provider per trial are ever scheduled, so a third
-  consecutive failure means its budget is spent or its outage has begun;
-  stopping at two would blacklist a provider that only had two scheduled
-  failures back to back and still has budget left.
+- Before serving, the workload manifest is assigned to providers by
+  a min-cost flow: each request goes to the provider whose best legal
+  model loses the least sealed rating against that request's best,
+  with at most two assigned calls per provider. Spreading the load
+  this way keeps the strongest providers from being drained by the
+  first requests that want them, which is what the score's tie-break
+  (fewest provider calls) rewards: a failed first attempt costs a
+  whole extra call.
+- At runtime each request first tries its planned provider, then the
+  other providers in sealed-rating order (ties: provider id, model
+  id), one attempt each. A refusal is a property of the provider's
+  budget / failure schedule / outage, not of the model, so retrying
+  another model on the same provider would only burn budget.
+- The plan uses only the brief (directory, quality table, manifest):
+  no trial seed, no hidden budget or failure schedule. Every choice is
+  a function of the brief and of the provider answers seen so far.
 - The provider echoes exactly what it parsed, so the request is
   translated losslessly: system text, last user text, tool names,
   max_tokens, stop sequences, image bytes and JSON mode all survive the
@@ -49,15 +54,6 @@ from urllib.parse import quote, urlparse
 
 CREATED = 1767225600
 ANTHROPIC_VERSION = "2023-06-01"
-
-# Conservative per-provider attempt caps: the floor of each free tier's
-# drawn trial budget. Greedy ranking plus these caps keeps the strongest
-# providers from being drained by the first requests that want them.
-SOFT_CAP = {
-    "groq": 9, "cerebras": 5, "gemini": 6, "zai": 4, "openrouter": 10,
-    "sambanova": 4, "pollinations": 10, "cloudflare": 7, "ovh": 5,
-    "kilol": 12,
-}
 
 # Long-log requests are the min_context ones: their user text carries a
 # 140-line service log. Every other request body is far shorter.
@@ -752,13 +748,144 @@ def render_anthropic_sse(model, text, uin, uout):
 # Routing
 # --------------------------------------------------------------------------
 
+def _mcmf(n_nodes, edges, source, sink, max_flow):
+    """Min-cost flow by successive shortest paths (Bellman-Ford).
+
+    edges: (u, v, capacity, cost). Returns (flow, cost, graph) where the
+    graph holds residual capacities; a forward edge drained to 0 carried
+    one unit of flow. Deterministic: edges relax in insertion order and
+    only strict improvements move a label.
+    """
+    graph = [[] for _ in range(n_nodes)]
+
+    def add(u, v, cap, cost):
+        graph[u].append([v, cap, cost, len(graph[v])])
+        graph[v].append([u, 0, -cost, len(graph[u]) - 1])
+
+    for u, v, cap, cost in edges:
+        add(u, v, cap, cost)
+    flow = 0
+    total = 0
+    inf = 10 ** 18
+    while flow < max_flow:
+        dist = [inf] * n_nodes
+        prev = [None] * n_nodes
+        dist[source] = 0
+        for _ in range(n_nodes):
+            updated = False
+            for u in range(n_nodes):
+                if dist[u] == inf:
+                    continue
+                for i, edge in enumerate(graph[u]):
+                    v, cap, c, _rev = edge
+                    if cap > 0 and dist[u] + c < dist[v]:
+                        dist[v] = dist[u] + c
+                        prev[v] = (u, i)
+                        updated = True
+            if not updated:
+                break
+        if dist[sink] == inf:
+            break
+        push = max_flow - flow
+        v = sink
+        while v != source:
+            u, i = prev[v]
+            push = min(push, graph[u][i][1])
+            v = u
+        v = sink
+        while v != source:
+            u, i = prev[v]
+            edge = graph[u][i]
+            edge[1] -= push
+            graph[v][edge[3]][1] += push
+            total += push * edge[2]
+            v = u
+        flow += push
+    return flow, total, graph
+
+
+def _best_for_manifest(ratings, providers, entry):
+    """Best free model per provider for one manifest entry.
+
+    Eligibility mirrors the simulator: the entry's requires (tools /
+    vision / json / min_context) plus the wire rule that an OpenAI
+    JSON-mode request never goes to an Anthropic-wire provider.
+    Returns {provider id: (rating_milli, model id)}.
+    """
+    req = entry.get("requires", {}) or {}
+    api = entry.get("api", "")
+    best = {}
+    for row in ratings:
+        if not row.get("free", True):
+            continue
+        prov = providers.get(row["provider"])
+        if prov is None:
+            continue
+        if api == "openai" and req.get("json") and prov["wire"] == "anthropic":
+            continue
+        if req.get("tools") and not row.get("tools"):
+            continue
+        if req.get("vision") and not row.get("vision"):
+            continue
+        if req.get("json") and not row.get("json"):
+            continue
+        if "min_context" in req:
+            ctx = row.get("context_length") or 0
+            if ctx < req["min_context"]:
+                continue
+        key = (-row["rating_milli"], row["provider"], row["model"])
+        prev = best.get(row["provider"])
+        if prev is None or key < prev[0]:
+            best[row["provider"]] = (key, row["model"])
+    return {pid: (-key[0], model) for pid, (key, model) in best.items()}
+
+
+def plan_assignment(ratings, providers, manifest, cap=2):
+    """Assign each manifest request to one provider, at most `cap` each.
+
+    Min-cost flow: cost is the request's weight times the rating lost
+    against its best legal model, so the plan maximises sealed quality
+    under the per-provider cap. Returns {manifest index: provider id};
+    a request with no legal provider is left out and falls back to
+    rating order at runtime.
+    """
+    pids = list(providers.keys())
+    n_req = len(manifest)
+    n_prov = len(pids)
+    n_nodes = 2 + n_req + n_prov
+    source, sink = 0, n_nodes - 1
+    edges = []
+    for i, entry in enumerate(manifest):
+        edges.append((source, 1 + i, 1, 0))
+        best = _best_for_manifest(ratings, providers, entry)
+        for j, pid in enumerate(pids):
+            if pid not in best:
+                continue
+            rating, _model = best[pid]
+            edges.append((1 + i, 1 + n_req + j, 1,
+                          -entry.get("weight", 1) * rating))
+    for j in range(n_prov):
+        edges.append((1 + n_req + j, sink, cap, 0))
+    _flow, _cost, graph = _mcmf(n_nodes, edges, source, sink, n_req)
+    assign = {}
+    for i in range(n_req):
+        for edge in graph[1 + i]:
+            v, cap_left, c, _rev = edge
+            if 1 + n_req <= v < 1 + n_req + n_prov and cap_left == 0 and c < 0:
+                assign[i] = pids[v - (1 + n_req)]
+    return assign
+
+
 class Router:
-    def __init__(self, directory, ratings):
+    def __init__(self, directory, ratings, manifest=None):
         self.providers = {p["id"]: p for p in directory}
         self.ratings = ratings
         self.calls = {}
         self.fails = {}
         self.lock = threading.Lock()
+        self.manifest = manifest or []
+        self.plan = plan_assignment(ratings, self.providers, self.manifest)
+        self.served = 0
 
     def ranking(self, req):
         """Best free model per provider for this request, best first."""
@@ -801,27 +928,29 @@ class Router:
         return None
 
     def serve(self, req):
-        """Return (model, text, uin, uout) or None if no provider serves."""
+        """Return (model, text, uin, uout) or None if no provider serves.
+
+        The client sends the manifest in order, so the n-th request
+        served is the manifest's n-th entry: try its planned provider
+        first, then every other eligible provider in sealed-rating
+        order, one attempt each. No second round and no caps: the plan
+        already spreads the load, and a retry would only spend another
+        call on a provider the trial has already refused.
+        """
         with self.lock:
+            planned = self.plan.get(self.served)
+            self.served += 1
             ranking = self.ranking(req)
-            failed = []
-            for pid, model in ranking:
-                if self.calls.get(pid, 0) >= SOFT_CAP.get(pid, 10 ** 9):
-                    continue
-                if self.fails.get(pid, 0) >= 3:
-                    continue
-                got = self._try(pid, model, req)
-                if got is not None:
-                    return (model,) + got
-                failed.append((pid, model))
-            # Second round: one retry of each provider that failed once.
-            # A scheduled single-call failure recovers here; a spent
-            # budget or an outage fails again and stays skipped.
-            for pid, model in failed:
-                if self.fails.get(pid, 0) >= 3:
-                    continue
-                if self.calls.get(pid, 0) >= SOFT_CAP.get(pid, 10 ** 9):
-                    continue
+            order = []
+            if planned is not None:
+                for pid, model in ranking:
+                    if pid == planned:
+                        order.append((pid, model))
+                        break
+            order.extend(
+                (pid, model) for pid, model in ranking if pid != planned
+            )
+            for pid, model in order:
                 got = self._try(pid, model, req)
                 if got is not None:
                     return (model,) + got
@@ -1160,7 +1289,7 @@ def main(argv):
     for row in ratings:
         if row["model"] not in FREE_CTX:
             FREE_CTX[row["model"]] = row.get("context_length")
-    ROUTER = Router(directory, ratings)
+    ROUTER = Router(directory, ratings, _manifest)
 
     server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
     port = server.server_address[1]
