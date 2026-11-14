@@ -16,18 +16,22 @@ Design notes, each derived from the kit's env / scorer / generator:
   answers seen so far: no wall clock, no unseeded randomness. A replay
   therefore sees the same answers and makes the same choices.
 - Before serving, the workload manifest is assigned to providers by
-  a min-cost flow: each request goes to the provider whose best legal
-  model loses the least sealed rating against that request's best,
-  with at most two assigned calls per provider. Spreading the load
+  a min-cost flow with capacity one call per provider: the ten best
+  request-provider pairs by sealed rating lost, one call each. The
+  other ten requests are served by the fallback. Spreading the load
   this way keeps the strongest providers from being drained by the
   first requests that want them, which is what the score's tie-break
   (fewest provider calls) rewards: a failed first attempt costs a
   whole extra call.
 - At runtime each request first tries its planned provider, then the
-  other providers in sealed-rating order (ties: provider id, model
-  id), one attempt each. A refusal is a property of the provider's
-  budget / failure schedule / outage, not of the model, so retrying
-  another model on the same provider would only burn budget.
+  other providers ordered by failure hazard for their next call,
+  least hazardous first, with the sealed rating breaking ties. The
+  hazard is a posterior over the provider's budget, scheduled
+  failing calls and outage start, using only the kit-published draw
+  ranges as the prior and the provider's own answers so far as
+  evidence. A refusal is a property of the provider's budget /
+  failure schedule / outage, not of the model, so retrying another
+  model on the same provider would only burn budget.
 - The plan uses only the brief (directory, quality table, manifest):
   no trial seed, no hidden budget or failure schedule. Every choice is
   a function of the brief and of the provider answers seen so far.
@@ -50,6 +54,8 @@ import threading
 import time
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import combinations
+from math import comb
 from urllib.parse import quote, urlparse
 
 CREATED = 1767225600
@@ -876,6 +882,75 @@ def plan_assignment(ratings, providers, manifest, cap=2):
     return assign
 
 
+# --------------------------------------------------------------------------
+# Failure-hazard posterior
+# --------------------------------------------------------------------------
+#
+# Each provider fails on a few scheduled call numbers, runs out of
+# budget after a few calls, and one provider per trial goes out
+# mid-trial. The kit publishes the draw ranges for all three, so the
+# router keeps, per provider, every hypothesis consistent with the
+# answers seen so far and scores the next call by the fraction of
+# surviving hypotheses under which it fails. Nothing here uses the
+# trial seed or any trial's actual draws; the prior is the published
+# distribution and the evidence is only what this trial answered.
+
+_BUDGET_RANGES = {
+    "groq": (9, 12),
+    "cerebras": (5, 6),
+    "gemini": (6, 8),
+    "zai": (4, 5),
+    "openrouter": (10, 12),
+    "sambanova": (4, 5),
+    "pollinations": (10, 14),
+    "cloudflare": (7, 8),
+    "ovh": (5, 6),
+    "kilol": (12, 16),
+}
+
+
+def _provider_hypotheses(pid):
+    """(weight, budget, failing calls, outage start) for one provider.
+
+    Budget is uniform over the published range; the failing calls are
+    one or two distinct numbers drawn from 2..budget-1; one provider
+    in ten is forced to fail on its second call; one provider in ten
+    goes out at a number drawn from 2..budget-1, the rest never do.
+    """
+    lo, hi = _BUDGET_RANGES.get(pid, (4, 16))
+    hypos = []
+    for budget in range(lo, hi + 1):
+        span = budget - 2
+        for count in (1, 2):
+            if count > span:
+                continue
+            for raw in combinations(range(2, budget), count):
+                raw_set = set(raw)
+                for forced in (False, True):
+                    if forced and 2 not in raw_set:
+                        fails = tuple(sorted(
+                            (raw_set - {min(raw_set)}) | {2}))
+                    else:
+                        fails = tuple(sorted(raw_set))
+                    weight = (1.0 / (hi - lo + 1)) * 0.5
+                    weight /= comb(span, count)
+                    weight *= 0.1 if forced else 0.9
+                    hypos.append((weight * 0.9, budget, fails, None))
+                    out_weight = weight * 0.1 / span
+                    for start in range(2, budget):
+                        hypos.append((out_weight, budget, fails, start))
+    return hypos
+
+
+def _classify_refusal(message):
+    """'budget', 'outage' or 'transient' for a provider error message."""
+    if "budget is spent" in message:
+        return "budget"
+    if " is out" in message:
+        return "outage"
+    return "transient"
+
+
 class Router:
     def __init__(self, directory, ratings, manifest=None):
         self.providers = {p["id"]: p for p in directory}
@@ -884,11 +959,18 @@ class Router:
         self.fails = {}
         self.lock = threading.Lock()
         self.manifest = manifest or []
-        self.plan = plan_assignment(ratings, self.providers, self.manifest)
+        self.plan = plan_assignment(ratings, self.providers, self.manifest, cap=1)
         self.served = 0
+        self.hypo = {}
+        self.hypo_total = {}
 
     def ranking(self, req):
-        """Best free model per provider for this request, best first."""
+        """Best free model per provider for this request, best first.
+
+        Returns [(provider id, model id, rating_milli)] in sealed-rating
+        order; the rating rides along so the fallback can break hazard
+        ties toward the stronger model.
+        """
         best = {}
         for row in self.ratings:
             if not row.get("free", True):
@@ -913,43 +995,116 @@ class Router:
             if prev is None or key < prev[0]:
                 best[row["provider"]] = (key, row["model"])
         ordered = sorted(best.items(), key=lambda kv: kv[1][0])
-        return [(pid, model) for pid, (_key, model) in ordered]
+        return [(pid, model, -key[0]) for pid, (key, model) in ordered]
+
+    def _observe(self, pid, number, kind):
+        """Drop every hypothesis inconsistent with one observed call.
+
+        kind is "ok", "budget", "outage" or "transient"; number is the
+        provider's call number (1-based). The env refuses in the order
+        budget, then outage, then scheduled fail, so each message pins
+        down what the hypothesis must look like.
+        """
+        hypos = self.hypo.get(pid)
+        if hypos is None:
+            hypos = _provider_hypotheses(pid)
+        kept = []
+        total = 0.0
+        for w, budget, fails, outage in hypos:
+            if kind == "ok":
+                if number > budget or number in fails:
+                    continue
+                if outage is not None and number >= outage:
+                    continue
+            elif kind == "budget":
+                if number <= budget:
+                    continue
+            elif kind == "outage":
+                if number > budget or outage is None or number < outage:
+                    continue
+            else:  # transient scheduled fail
+                if number > budget or number not in fails:
+                    continue
+                if outage is not None and number >= outage:
+                    continue
+            kept.append((w, budget, fails, outage))
+            total += w
+        self.hypo[pid] = kept
+        self.hypo_total[pid] = total
+
+    def _hazard(self, pid, number):
+        """Fraction of surviving hypotheses under which call `number`
+        to this provider fails: over budget, past its outage start, or
+        a scheduled failing call."""
+        hypos = self.hypo.get(pid)
+        if hypos is None:
+            hypos = _provider_hypotheses(pid)
+            self.hypo[pid] = hypos
+            self.hypo_total[pid] = sum(w for w, _b, _f, _o in hypos)
+        total = self.hypo_total[pid]
+        if total <= 0:
+            return 0.0
+        bad = 0.0
+        for w, budget, fails, outage in hypos:
+            if number > budget:
+                bad += w
+            elif outage is not None and number >= outage:
+                bad += w
+            elif number in fails:
+                bad += w
+        return bad / total
 
     def _try(self, pid, model, req):
-        self.calls[pid] = self.calls.get(pid, 0) + 1
         try:
-            ok, payload = call_provider(self.providers[pid], model, req)
+            ok, payload, err = call_provider(self.providers[pid], model, req)
         except Exception:
-            ok, payload = False, None
+            return None
         if ok:
+            self.calls[pid] = self.calls.get(pid, 0) + 1
+            self._observe(pid, self.calls[pid], "ok")
             self.fails[pid] = 0
             return payload
-        self.fails[pid] = self.fails.get(pid, 0) + 1
+        if err is not None:
+            self.calls[pid] = self.calls.get(pid, 0) + 1
+            self._observe(pid, self.calls[pid], _classify_refusal(err))
+            self.fails[pid] = self.fails.get(pid, 0) + 1
         return None
 
     def serve(self, req):
         """Return (model, text, uin, uout) or None if no provider serves.
 
         The client sends the manifest in order, so the n-th request
-        served is the manifest's n-th entry: try its planned provider
-        first, then every other eligible provider in sealed-rating
-        order, one attempt each. No second round and no caps: the plan
-        already spreads the load, and a retry would only spend another
-        call on a provider the trial has already refused.
+        served is the manifest's n-th entry. Its planned provider (the
+        cap-1 flow assigned at most one request per provider) goes
+        first; the rest are ordered by failure hazard for their next
+        call, least hazardous first, with the sealed rating breaking
+        ties toward the stronger model. Providers already observed
+        permanently dead (budget spent or outage started) are left out
+        unless that empties the list. One attempt per provider, no
+        second round: a refusal is a property of the provider's
+        budget / failure schedule / outage, not of the model.
         """
         with self.lock:
             planned = self.plan.get(self.served)
             self.served += 1
             ranking = self.ranking(req)
+            scored = []
+            for pid, model, rating in ranking:
+                nxt = self.calls.get(pid, 0) + 1
+                scored.append((self._hazard(pid, nxt), -rating, pid, model))
+            alive = [s for s in scored if s[0] < 1.0]
+            pool = alive if alive else scored
             order = []
             if planned is not None:
-                for pid, model in ranking:
+                for _hazard, _negrating, pid, model in pool:
                     if pid == planned:
                         order.append((pid, model))
                         break
-            order.extend(
-                (pid, model) for pid, model in ranking if pid != planned
+            rest = sorted(
+                (s for s in pool if s[2] != planned),
+                key=lambda s: (s[0], s[1]),
             )
+            order.extend((pid, model) for _h, _nr, pid, model in rest)
             for pid, model in order:
                 got = self._try(pid, model, req)
                 if got is not None:
@@ -981,12 +1136,32 @@ def http_call(origin, method, path, headers, body_bytes, timeout=10):
         conn.close()
 
 
-def call_provider(prov, model, req):
-    """One provider call. Returns (True, (text, uin, uout)) or (False, None).
+def _error_message(raw):
+    """The provider's error text from a non-200 body, or None.
 
-    A 200 is always accepted: the env records it as the request's one
-    successful call, so calling another provider after it would break
-    the one-provider check. Any other status fails over.
+    All three wires carry it as error.message in a JSON body.
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        msg = err.get("message")
+        if isinstance(msg, str) and msg:
+            return msg
+    return None
+
+
+def call_provider(prov, model, req):
+    """One provider call.
+
+    Returns (True, (text, uin, uout), None) on a 200, or
+    (False, None, message) on a refusal, where message is the
+    provider's error text (or None when the call never reached the
+    provider). A 200 is always accepted: the env records it as the
+    request's one successful call, so calling another provider after
+    it would break the one-provider check. Any other status fails over.
     """
     wire = prov["wire"]
     headers = {"Content-Type": "application/json"}
@@ -1020,9 +1195,9 @@ def call_provider(prov, model, req):
             json.dumps(payload).encode("utf-8"), timeout=10,
         )
     except Exception:
-        return False, None
+        return False, None, None
     if status != 200:
-        return False, None
+        return False, None, _error_message(raw)
     text, uin, uout = parse_provider_response(wire, req["stream"], raw)
     if uin is None or uout is None:
         cuin, cuout = recompute_usage(req, text)
@@ -1030,7 +1205,7 @@ def call_provider(prov, model, req):
             uin = cuin
         if uout is None:
             uout = cuout
-    return True, (text, int(uin), int(uout))
+    return True, (text, int(uin), int(uout)), None
 
 
 def models_list_shape(headers):
